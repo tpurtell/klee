@@ -471,7 +471,6 @@ int    pthread_attr_setdetachstate(pthread_attr_t *a, int p)
   return 0;
 }
 void   pthread_yield(void) {
-  if(klee_int("should yield"))
-    __thread_yield();
+  __thread_yield();
 }
 
