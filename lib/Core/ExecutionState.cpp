@@ -60,20 +60,30 @@ StackFrame::~StackFrame() {
   delete[] locals; 
 }
 
+ThreadState::ThreadState()
+: pc(0)
+, prevPC(0)
+{
+}
 /***/
 
 ExecutionState::ExecutionState(KFunction *kf) 
   : fakeState(false),
     underConstrained(false),
     depth(0),
-    pc(kf->instructions),
-    prevPC(pc),
+    nextTid(1),
     queryCost(0.), 
     weight(1),
     instsSinceCovNew(0),
     coveredNew(false),
     forkDisabled(false),
     ptreeNode(0) {
+  threads.push_back(ThreadState());
+  threads.back().tid = nextTid;
+  tids.insert(nextTid);
+  ++nextTid;
+  threads.front().pc = kf->instructions;
+  threads.front().prevPC = threads.front().pc;
   pushFrame(0, kf);
 }
 
@@ -86,7 +96,10 @@ ExecutionState::ExecutionState(const std::vector<ref<Expr> > &assumptions)
 }
 
 ExecutionState::~ExecutionState() {
-  while (!stack.empty()) popFrame();
+  while(!threads.empty()) {
+    while (!threads.front().stack.empty()) popFrame();
+    threads.pop_front();
+  }
 }
 
 ExecutionState *ExecutionState::branch() {
@@ -103,15 +116,15 @@ ExecutionState *ExecutionState::branch() {
 }
 
 void ExecutionState::pushFrame(KInstIterator caller, KFunction *kf) {
-  stack.push_back(StackFrame(caller,kf));
+  threads.front().stack.push_back(StackFrame(caller,kf));
 }
 
 void ExecutionState::popFrame() {
-  StackFrame &sf = stack.back();
+  StackFrame &sf = threads.front().stack.back();
   for (std::vector<const MemoryObject*>::iterator it = sf.allocas.begin(), 
          ie = sf.allocas.end(); it != ie; ++it)
     addressSpace.unbindObject(*it);
-  stack.pop_back();
+  threads.front().stack.pop_back();
 }
 
 ///
@@ -150,27 +163,33 @@ bool ExecutionState::merge(const ExecutionState &b) {
   if (DebugLogStateMerge)
     std::cerr << "-- attempting merge of A:" 
                << this << " with B:" << &b << "--\n";
-  if (pc != b.pc)
+  if(threads.size() != b.threads.size())
     return false;
+    
+  for(ThreadList::const_iterator 
+        i = threads.begin(), j = b.threads.begin(); 
+        i != threads.end(); ++i, ++j) 
+  {
+    if (i->pc != j->pc)
+      return false;
 
+    if(i->stack.size() != j->stack.size())
+      return false;
+    for(std::vector<StackFrame>::const_iterator 
+      itA = i->stack.begin(), itB = j->stack.begin();
+      itA != i->stack.end(); ++itA, ++itB)
+    {
+      // XXX vaargs?
+      if (itA->caller!=itB->caller || itA->kf!=itB->kf)
+        return false;
+    }
+  }
+
+  // ???: these aren't per thread... assuming symbolics are global state
   // XXX is it even possible for these to differ? does it matter? probably
   // implies difference in object states?
   if (symbolics!=b.symbolics)
     return false;
-
-  {
-    std::vector<StackFrame>::const_iterator itA = stack.begin();
-    std::vector<StackFrame>::const_iterator itB = b.stack.begin();
-    while (itA!=stack.end() && itB!=b.stack.end()) {
-      // XXX vaargs?
-      if (itA->caller!=itB->caller || itA->kf!=itB->kf)
-        return false;
-      ++itA;
-      ++itB;
-    }
-    if (itA!=stack.end() || itB!=b.stack.end())
-      return false;
-  }
 
   std::set< ref<Expr> > aConstraints(constraints.begin(), constraints.end());
   std::set< ref<Expr> > bConstraints(b.constraints.begin(), 
@@ -261,19 +280,24 @@ bool ExecutionState::merge(const ExecutionState &b) {
   // it seems like it can make a difference, even though logically
   // they must contradict each other and so inA => !inB
 
-  std::vector<StackFrame>::iterator itA = stack.begin();
-  std::vector<StackFrame>::const_iterator itB = b.stack.begin();
-  for (; itA!=stack.end(); ++itA, ++itB) {
-    StackFrame &af = *itA;
-    const StackFrame &bf = *itB;
-    for (unsigned i=0; i<af.kf->numRegisters; i++) {
-      ref<Expr> &av = af.locals[i].value;
-      const ref<Expr> &bv = bf.locals[i].value;
-      if (av.isNull() || bv.isNull()) {
-        // if one is null then by implication (we are at same pc)
-        // we cannot reuse this local, so just ignore
-      } else {
-        av = SelectExpr::create(inA, av, bv);
+  ThreadList::iterator i = threads.begin();
+  for(ThreadList::const_iterator j = b.threads.begin(); 
+      i != threads.end(); ++i, ++j) 
+  {
+    std::vector<StackFrame>::iterator itA = i->stack.begin();
+    std::vector<StackFrame>::const_iterator itB = j->stack.begin();
+    for (; itA!=i->stack.end(); ++itA, ++itB) {
+      StackFrame &af = *itA;
+      const StackFrame &bf = *itB;
+      for (unsigned i=0; i<af.kf->numRegisters; i++) {
+        ref<Expr> &av = af.locals[i].value;
+        const ref<Expr> &bv = bf.locals[i].value;
+        if (av.isNull() || bv.isNull()) {
+          // if one is null then by implication (we are at same pc)
+          // we cannot reuse this local, so just ignore
+        } else {
+          av = SelectExpr::create(inA, av, bv);
+        }
       }
     }
   }
@@ -306,9 +330,9 @@ bool ExecutionState::merge(const ExecutionState &b) {
 
 void ExecutionState::dumpStack(std::ostream &out) const {
   unsigned idx = 0;
-  const KInstruction *target = prevPC;
+  const KInstruction *target = threads.front().prevPC;
   for (ExecutionState::stack_ty::const_reverse_iterator
-         it = stack.rbegin(), ie = stack.rend();
+         it = threads.front().stack.rbegin(), ie = threads.front().stack.rend();
        it != ie; ++it) {
     const StackFrame &sf = *it;
     Function *f = sf.kf->function;

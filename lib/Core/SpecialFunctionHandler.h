@@ -19,6 +19,16 @@ namespace llvm {
 }
 
 namespace klee {
+  namespace ThreadOperation {
+    enum ThreadOperation {
+      None,
+      Create,
+      Yield,
+      Alive,
+      Detach,
+      Tid
+    };
+  }
   class Executor;
   class Expr;
   class ExecutionState;
@@ -35,6 +45,11 @@ namespace klee {
                      std::pair<Handler,bool> > handlers_ty;
 
     handlers_ty handlers;
+    typedef std::map<const llvm::Function*, 
+                     std::pair<ThreadOperation::ThreadOperation,bool> > thread_handlers_ty;
+
+    thread_handlers_ty threadHandlers;
+
     class Executor &executor;
 
   public:
@@ -51,6 +66,11 @@ namespace klee {
     void bind();
 
     bool handle(ExecutionState &state, 
+                llvm::Function *f,
+                KInstruction *target,
+                std::vector< ref<Expr> > &arguments);
+
+    ThreadOperation::ThreadOperation threaded(ExecutionState &state, 
                 llvm::Function *f,
                 KInstruction *target,
                 std::vector< ref<Expr> > &arguments);

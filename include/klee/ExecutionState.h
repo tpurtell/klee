@@ -21,6 +21,7 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <list>
 
 namespace klee {
   class Array;
@@ -61,9 +62,22 @@ struct StackFrame {
   ~StackFrame();
 };
 
+typedef unsigned int tid_t;
+struct ThreadState {
+  typedef std::vector<StackFrame> stack_ty;
+
+  // pc - pointer to current instruction stream
+  KInstIterator pc, prevPC;
+  stack_ty stack;
+  tid_t tid;
+  ThreadState();
+};
+
+typedef std::list<ThreadState> ThreadList;
+
 class ExecutionState {
 public:
-  typedef std::vector<StackFrame> stack_ty;
+  typedef ThreadState::stack_ty stack_ty;
 
 private:
   // unsupported, use copy constructor
@@ -77,9 +91,11 @@ public:
   unsigned underConstrained;
   unsigned depth;
   
-  // pc - pointer to current instruction stream
-  KInstIterator pc, prevPC;
-  stack_ty stack;
+  ThreadList threads;
+  std::set<tid_t> tids;
+  std::set<tid_t> detachedTids;
+  unsigned int nextTid;
+  
   ConstraintManager constraints;
   mutable double queryCost;
   double weight;

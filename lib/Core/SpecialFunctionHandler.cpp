@@ -113,13 +113,27 @@ HandlerInfo handlerInfo[] = {
 #undef add  
 };
 
+struct ThereadHandlerInfo {
+  const char *name;
+  bool hasReturnValue; /// Intrinsic has a return value
+  ThreadOperation::ThreadOperation op;
+};
+ThereadHandlerInfo threadHandlerInfo[] = {
+#define add(name, ret, op) { name, ret, op }
+  add("__thread_create", true, ThreadOperation::Create),
+  add("__thread_yield", false, ThreadOperation::Yield),
+  add("__thread_alive", true, ThreadOperation::Alive),
+  add("__thread_detach", false, ThreadOperation::Detach),
+  add("__thread_tid", true, ThreadOperation::Tid),
+#undef add  
+};
+
 SpecialFunctionHandler::SpecialFunctionHandler(Executor &_executor) 
   : executor(_executor) {}
 
 
 void SpecialFunctionHandler::prepare() {
   unsigned N = sizeof(handlerInfo)/sizeof(handlerInfo[0]);
-
   for (unsigned i=0; i<N; ++i) {
     HandlerInfo &hi = handlerInfo[i];
     Function *f = executor.kmodule->module->getFunction(hi.name);
@@ -139,17 +153,41 @@ void SpecialFunctionHandler::prepare() {
         f->deleteBody();
     }
   }
+  
+  N = sizeof(threadHandlerInfo)/sizeof(threadHandlerInfo[0]);
+  for (unsigned i=0; i<N; ++i) {
+    ThereadHandlerInfo &hi = threadHandlerInfo[i];
+    Function *f = executor.kmodule->module->getFunction(hi.name);
+    
+    // No need to create if the function doesn't exist, since it cannot
+    // be called in that case.
+  
+    if (f) {
+      // Change to a declaration since we handle internally (simplifies
+      // module and allows deleting dead code).
+      if (!f->isDeclaration())
+        f->deleteBody();
+    }
+  }
 }
 
 void SpecialFunctionHandler::bind() {
   unsigned N = sizeof(handlerInfo)/sizeof(handlerInfo[0]);
-
   for (unsigned i=0; i<N; ++i) {
     HandlerInfo &hi = handlerInfo[i];
     Function *f = executor.kmodule->module->getFunction(hi.name);
     
     if (f && (!hi.doNotOverride || f->isDeclaration()))
       handlers[f] = std::make_pair(hi.handler, hi.hasReturnValue);
+  }
+
+  N = sizeof(threadHandlerInfo)/sizeof(threadHandlerInfo[0]);
+  for (unsigned i=0; i<N; ++i) {
+    ThereadHandlerInfo &hi = threadHandlerInfo[i];
+    Function *f = executor.kmodule->module->getFunction(hi.name);
+    
+    if (f)
+      threadHandlers[f] = std::make_pair(hi.op, hi.hasReturnValue);
   }
 }
 
@@ -174,6 +212,26 @@ bool SpecialFunctionHandler::handle(ExecutionState &state,
     return false;
   }
 }
+
+ThreadOperation::ThreadOperation SpecialFunctionHandler::threaded(ExecutionState &state, 
+                                    Function *f,
+                                    KInstruction *target,
+                                    std::vector< ref<Expr> > &arguments) {
+  thread_handlers_ty::iterator it = threadHandlers.find(f);
+  if (it != threadHandlers.end()) {    
+    ThreadOperation::ThreadOperation op = it->second.first;
+    bool hasReturnValue = it->second.second;
+     // FIXME: Check this... add test?
+    if (!hasReturnValue && !target->inst->use_empty()) {
+      executor.terminateStateOnExecError(state, 
+                                         "expected return value from void special function");
+    } 
+    return op;
+  } else {
+    return ThreadOperation::None;
+  }
+}
+
 
 /****/
 
@@ -384,7 +442,7 @@ void SpecialFunctionHandler::handleIsSymbolic(ExecutionState &state,
                                 std::vector<ref<Expr> > &arguments) {
   assert(arguments.size()==1 && "invalid number of arguments to klee_is_symbolic");
 
-  executor.bindLocal(target, state, 
+  executor.bindLocal(target, state, state.threads.front(), 
                      ConstantExpr::create(!isa<ConstantExpr>(arguments[0]),
                                           Expr::Int32));
 }
@@ -446,7 +504,7 @@ void SpecialFunctionHandler::handleWarning(ExecutionState &state,
   assert(arguments.size()==1 && "invalid number of arguments to klee_warning");
 
   std::string msg_str = readStringAtAddress(state, arguments[0]);
-  klee_warning("%s: %s", state.stack.back().kf->function->getName().data(), 
+  klee_warning("%s: %s", state.threads.front().stack.back().kf->function->getName().data(), 
                msg_str.c_str());
 }
 
@@ -457,7 +515,7 @@ void SpecialFunctionHandler::handleWarningOnce(ExecutionState &state,
          "invalid number of arguments to klee_warning_once");
 
   std::string msg_str = readStringAtAddress(state, arguments[0]);
-  klee_warning_once(0, "%s: %s", state.stack.back().kf->function->getName().data(),
+  klee_warning_once(0, "%s: %s", state.threads.front().stack.back().kf->function->getName().data(),
                     msg_str.c_str());
 }
 
@@ -501,7 +559,7 @@ void SpecialFunctionHandler::handleGetObjSize(ExecutionState &state,
   executor.resolveExact(state, arguments[0], rl, "klee_get_obj_size");
   for (Executor::ExactResolutionList::iterator it = rl.begin(), 
          ie = rl.end(); it != ie; ++it) {
-    executor.bindLocal(target, *it->second, 
+    executor.bindLocal(target, *it->second, state.threads.front(),
                        ConstantExpr::create(it->first.first->size, Expr::Int32));
   }
 }
@@ -512,7 +570,7 @@ void SpecialFunctionHandler::handleGetErrno(ExecutionState &state,
   // XXX should type check args
   assert(arguments.size()==0 &&
          "invalid number of arguments to klee_get_errno");
-  executor.bindLocal(target, state,
+  executor.bindLocal(target, state, state.threads.front(),
                      ConstantExpr::create(errno, Expr::Int32));
 }
 
@@ -615,7 +673,7 @@ void SpecialFunctionHandler::handleGetValue(ExecutionState &state,
   assert(arguments.size()==1 &&
          "invalid number of arguments to klee_get_value");
 
-  executor.executeGetValue(state, arguments[0], target);
+  executor.executeGetValue(state, state.threads.front(), arguments[0], target);
 }
 
 void SpecialFunctionHandler::handleDefineFixedObject(ExecutionState &state,
@@ -630,8 +688,8 @@ void SpecialFunctionHandler::handleDefineFixedObject(ExecutionState &state,
   
   uint64_t address = cast<ConstantExpr>(arguments[0])->getZExtValue();
   uint64_t size = cast<ConstantExpr>(arguments[1])->getZExtValue();
-  MemoryObject *mo = executor.memory->allocateFixed(address, size, state.prevPC->inst);
-  executor.bindObjectInState(state, mo, false);
+  MemoryObject *mo = executor.memory->allocateFixed(address, size, state.threads.front().prevPC->inst);
+  executor.bindObjectInState(state, state.threads.front(), mo, false);
   mo->isUserSpecified = true; // XXX hack;
 }
 

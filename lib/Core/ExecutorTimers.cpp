@@ -145,19 +145,20 @@ void Executor::processTimers(ExecutionState *current,
     if (dumpStates) {
       std::ostream *os = interpreterHandler->openOutputFile("states.txt");
       
+      //???: only meaningful if we iterate over threads
       if (os) {
         for (std::set<ExecutionState*>::const_iterator it = states.begin(), 
                ie = states.end(); it != ie; ++it) {
           ExecutionState *es = *it;
           *os << "(" << es << ",";
           *os << "[";
-          ExecutionState::stack_ty::iterator next = es->stack.begin();
+          ExecutionState::stack_ty::iterator next = es->threads.front().stack.begin();
           ++next;
-          for (ExecutionState::stack_ty::iterator sfIt = es->stack.begin(),
-                 sf_ie = es->stack.end(); sfIt != sf_ie; ++sfIt) {
+          for (ExecutionState::stack_ty::iterator sfIt = es->threads.front().stack.begin(),
+                 sf_ie = es->threads.front().stack.end(); sfIt != sf_ie; ++sfIt) {
             *os << "('" << sfIt->kf->function->getNameStr() << "',";
-            if (next == es->stack.end()) {
-              *os << es->prevPC->info->line << "), ";
+            if (next == es->threads.front().stack.end()) {
+              *os << es->threads.front().prevPC->info->line << "), ";
             } else {
               *os << next->caller->info->line << "), ";
               ++next;
@@ -165,11 +166,11 @@ void Executor::processTimers(ExecutionState *current,
           }
           *os << "], ";
 
-          StackFrame &sf = es->stack.back();
-          uint64_t md2u = computeMinDistToUncovered(es->pc,
+          StackFrame &sf = es->threads.front().stack.back();
+          uint64_t md2u = computeMinDistToUncovered(es->threads.front().pc,
                                                     sf.minDistToUncoveredOnReturn);
           uint64_t icnt = theStatisticManager->getIndexedValue(stats::instructions,
-                                                               es->pc->info->id);
+                                                               es->threads.front().pc->info->id);
           uint64_t cpicnt = sf.callPathNode->statistics.getValue(stats::instructions);
 
           *os << "{";

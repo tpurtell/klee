@@ -23,6 +23,7 @@ namespace llvm {
 
 namespace klee {
   class ExecutionState;
+  class ThreadState;
   class Executor;  
   class InstructionInfoTable;
   class InterpreterHandler;
@@ -61,10 +62,10 @@ namespace klee {
     ~StatsTracker();
 
     // called after a new StackFrame has been pushed (for callpath tracing)
-    void framePushed(ExecutionState &es, StackFrame *parentFrame);
+    void framePushed(ThreadState &es, StackFrame *parentFrame);
 
     // called after a StackFrame has been popped 
-    void framePopped(ExecutionState &es);
+    void framePopped(ThreadState &es);
 
     // called when some side of a branch has been visited. it is
     // imperative that this be called when the statistics index is at

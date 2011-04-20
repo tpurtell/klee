@@ -200,6 +200,9 @@ private:
                             std::vector< ref<Expr> > &arguments);
 
   ObjectState *bindObjectInState(ExecutionState &state, const MemoryObject *mo,
+                                                         const Array *array = 0);
+
+  ObjectState *bindObjectInState(ExecutionState &state, ThreadState& ts, const MemoryObject *mo,
                                  bool isLocal, const Array *array = 0);
 
   /// Resolve a pointer to the memory objects it could point to the
@@ -253,6 +256,11 @@ private:
                    llvm::Function *f,
                    std::vector< ref<Expr> > &arguments);
                    
+  void pushCall(ExecutionState &es, ThreadState &state, 
+                  KInstruction *ki,
+                  llvm::Function *f,
+                  std::vector< ref<Expr> > &arguments);
+
   // do address resolution / object binding / out of bounds checking
   // and perform the operation
   void executeMemoryOperation(ExecutionState &state,
@@ -290,22 +298,26 @@ private:
                    ExecutionState &state) const;
 
   Cell& getArgumentCell(ExecutionState &state,
+                        ThreadState& ts,
                         KFunction *kf,
                         unsigned index) {
-    return state.stack.back().locals[kf->getArgRegister(index)];
+    return ts.stack.back().locals[kf->getArgRegister(index)];
   }
 
   Cell& getDestCell(ExecutionState &state,
+                    ThreadState& ts,
                     KInstruction *target) {
-    return state.stack.back().locals[target->dest];
+    return ts.stack.back().locals[target->dest];
   }
 
   void bindLocal(KInstruction *target, 
                  ExecutionState &state, 
+                 ThreadState& ts,
                  ref<Expr> value);
   void bindArgument(KFunction *kf, 
                     unsigned index,
                     ExecutionState &state,
+                    ThreadState& ts,
                     ref<Expr> value);
 
   ref<klee::ConstantExpr> evalConstantExpr(llvm::ConstantExpr *ce);
@@ -326,7 +338,7 @@ private:
 
   /// Bind a constant value for e to the given target. NOTE: This
   /// function may fork state if the state has multiple seeds.
-  void executeGetValue(ExecutionState &state, ref<Expr> e, KInstruction *target);
+  void executeGetValue(ExecutionState &state, ThreadState& ts, ref<Expr> e, KInstruction *target);
 
   /// Get textual information regarding a memory address.
   std::string getAddressInfo(ExecutionState &state, ref<Expr> address) const;

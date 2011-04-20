@@ -415,7 +415,7 @@ MemoryObject * Executor::addExternalObject(ExecutionState &state,
                                            bool isReadOnly) {
   MemoryObject *mo = memory->allocateFixed((uint64_t) (unsigned long) addr, 
                                            size, 0);
-  ObjectState *os = bindObjectInState(state, mo, false);
+  ObjectState *os = bindObjectInState(state, mo);
   for(unsigned i = 0; i < size; i++)
     os->write8(i, ((uint8_t*)addr)[i]);
   if(isReadOnly)
@@ -518,7 +518,7 @@ void Executor::initializeGlobals(ExecutionState &state) {
       }
 
       MemoryObject *mo = memory->allocate(size, false, true, i);
-      ObjectState *os = bindObjectInState(state, mo, false);
+      ObjectState *os = bindObjectInState(state, mo);
       globalObjects.insert(std::make_pair(i, mo));
       globalAddresses.insert(std::make_pair(i, mo->getBaseExpr()));
 
@@ -560,7 +560,7 @@ void Executor::initializeGlobals(ExecutionState &state) {
       if (!mo)
         mo = memory->allocate(size, false, true, &*i);
       assert(mo && "out of memory");
-      ObjectState *os = bindObjectInState(state, mo, false);
+      ObjectState *os = bindObjectInState(state, mo);
       globalObjects.insert(std::make_pair(i, mo));
       globalAddresses.insert(std::make_pair(i, mo->getBaseExpr()));
 
@@ -678,7 +678,7 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
        MaxStaticCPForkPct!=1. || MaxStaticCPSolvePct != 1.) &&
       statsTracker->elapsed() > 60.) {
     StatisticManager &sm = *theStatisticManager;
-    CallPathNode *cpn = current.stack.back().callPathNode;
+    CallPathNode *cpn = current.threads.front().stack.back().callPathNode;
     if ((MaxStaticForkPct<1. &&
          sm.getIndexedValue(stats::forks, sm.getIndex()) > 
          stats::forks*MaxStaticForkPct) ||
@@ -707,7 +707,7 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   bool success = solver->evaluate(current, condition, res);
   solver->setTimeout(0);
   if (!success) {
-    current.pc = current.prevPC;
+    current.threads.front().pc = current.threads.front().prevPC;
     terminateStateEarly(current, "query timed out");
     return StatePair(0, 0);
   }
@@ -962,19 +962,19 @@ const Cell& Executor::eval(KInstruction *ki, unsigned index,
     return kmodule->constantTable[index];
   } else {
     unsigned index = vnumber;
-    StackFrame &sf = state.stack.back();
+    StackFrame &sf = state.threads.front().stack.back();
     return sf.locals[index];
   }
 }
 
-void Executor::bindLocal(KInstruction *target, ExecutionState &state, 
+void Executor::bindLocal(KInstruction *target, ExecutionState &state, ThreadState& ts,
                          ref<Expr> value) {
-  getDestCell(state, target).value = value;
+  getDestCell(state, ts, target).value = value;
 }
 
 void Executor::bindArgument(KFunction *kf, unsigned index, 
-                            ExecutionState &state, ref<Expr> value) {
-  getArgumentCell(state, kf, index).value = value;
+                            ExecutionState &state, ThreadState& ts, ref<Expr> value) {
+  getArgumentCell(state, ts, kf, index).value = value;
 }
 
 ref<Expr> Executor::toUnique(const ExecutionState &state, 
@@ -1015,7 +1015,7 @@ Executor::toConstant(ExecutionState &state,
   std::ostringstream os;
   os << "silently concretizing (reason: " << reason << ") expression " << e 
      << " to value " << value 
-     << " (" << (*(state.pc)).info->file << ":" << (*(state.pc)).info->line << ")";
+     << " (" << (*(state.threads.front().pc)).info->file << ":" << (*(state.threads.front().pc)).info->line << ")";
       
   if (AllExternalWarnings)
     klee_warning(reason, os.str().c_str());
@@ -1028,6 +1028,7 @@ Executor::toConstant(ExecutionState &state,
 }
 
 void Executor::executeGetValue(ExecutionState &state,
+                               ThreadState& ts,
                                ref<Expr> e,
                                KInstruction *target) {
   e = state.constraints.simplifyExpr(e);
@@ -1038,7 +1039,7 @@ void Executor::executeGetValue(ExecutionState &state,
     bool success = solver->getValue(state, e, value);
     assert(success && "FIXME: Unhandled solver failure");
     (void) success;
-    bindLocal(target, state, value);
+    bindLocal(target, state, ts, value);
   } else {
     std::set< ref<Expr> > values;
     for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
@@ -1064,7 +1065,7 @@ void Executor::executeGetValue(ExecutionState &state,
            vie = values.end(); vit != vie; ++vit) {
       ExecutionState *es = *bit;
       if (es)
-        bindLocal(target, *es, *vit);
+        bindLocal(target, *es, ts, *vit);
       ++bit;
     }
   }
@@ -1072,17 +1073,17 @@ void Executor::executeGetValue(ExecutionState &state,
 
 void Executor::stepInstruction(ExecutionState &state) {
   if (DebugPrintInstructions) {
-    printFileLine(state, state.pc);
+    printFileLine(state, state.threads.front().pc);
     std::cerr << std::setw(10) << stats::instructions << " ";
-    llvm::errs() << *(state.pc->inst);
+    llvm::errs() << *(state.threads.front().pc->inst);
   }
 
   if (statsTracker)
     statsTracker->stepInstruction(state);
 
   ++stats::instructions;
-  state.prevPC = state.pc;
-  ++state.pc;
+  state.threads.front().prevPC = state.threads.front().pc;
+  ++state.threads.front().pc;
 
   if (stats::instructions==StopAfterNInstructions)
     haltExecution = true;
@@ -1094,16 +1095,25 @@ void Executor::executeCall(ExecutionState &state,
                            std::vector< ref<Expr> > &arguments) {
   Instruction *i = ki->inst;
   if (f && f->isDeclaration()) {
+    ThreadOperation::ThreadOperation thread_op = 
+      specialFunctionHandler->threaded(state, f, ki, arguments);
     switch(f->getIntrinsicID()) {
     case Intrinsic::not_intrinsic:
-      // state may be destroyed by this call, cannot touch
-      callExternalFunction(state, ki, f, arguments);
+      switch(thread_op) 
+      {
+      case ThreadOperation::None:
+        // state may be destroyed by this call, cannot touch
+        callExternalFunction(state, ki, f, arguments);
+        break;
+      default:
+        break;
+      }
       break;
         
       // va_arg is handled by caller and intrinsic lowering, see comment for
       // ExecutionState::varargs
     case Intrinsic::vastart:  {
-      StackFrame &sf = state.stack.back();
+      StackFrame &sf = state.threads.front().stack.back();
       assert(sf.varargs && 
              "vastart called in function with no vararg object");
 
@@ -1154,83 +1164,240 @@ void Executor::executeCall(ExecutionState &state,
 
     if (InvokeInst *ii = dyn_cast<InvokeInst>(i))
       transferToBasicBlock(ii->getNormalDest(), i->getParent(), state);
+    switch(thread_op) {
+    case ThreadOperation::Create: {
+      // klee_warning("thread creation");
+      if(arguments.size() < 1) {
+        terminateStateOnExecError(state, "need a function pointer to create a thread");
+        break;
+      }
+      std::vector< ref<Expr> > partial_arguments(arguments.begin() + 1, arguments.end());
+      ref<Expr> &v = arguments.front();
+
+      ExecutionState *free = &state;
+      bool hasInvalid = false, first = true;
+
+      /* XXX This is wasteful, no need to do a full evaluate since we
+         have already got a value. But in the end the caches should
+         handle it for us, albeit with some overhead. */
+      do {
+        ref<ConstantExpr> value;
+        bool success = solver->getValue(*free, v, value);
+        assert(success && "FIXME: Unhandled solver failure");
+        (void) success;
+        StatePair res = fork(*free, EqExpr::create(v, value), true);
+        if (res.first) {
+          uint64_t addr = value->getZExtValue();
+          if (legalFunctions.count(addr)) {
+            f = (Function*) addr;
+
+            // Don't give warning on unique resolution
+            if (res.second || !first)
+              klee_warning_once((void*) (unsigned long) addr, 
+                                "resolved symbolic function pointer to: %s",
+                                f->getName().data());
+
+              res.first->threads.push_back(ThreadState());
+              res.first->threads.back().tid = res.first->nextTid;
+              res.first->tids.insert(res.first->nextTid);
+              klee_warning("create tid %d", res.first->threads.back().tid);
+              //??? assert not too many tids
+              do {
+                ++res.first->nextTid;
+              } while(res.first->nextTid == 0 || res.first->tids.count(res.first->nextTid));
+              pushCall(*res.first, res.first->threads.back(), ki, f, partial_arguments);
+              res.first->threads.back().prevPC = res.first->threads.back().pc;
+              bindLocal(ki, *res.first, res.first->threads.front(), 
+                ConstantExpr::create(res.first->threads.back().tid, Expr::Int32));
+          } else {
+            if (!hasInvalid) {
+              terminateStateOnExecError(state, "invalid function pointer");
+              hasInvalid = true;
+            }
+          }
+        }
+
+        first = false;
+        free = res.second;
+      } while (free);
+      
+      //TODO: return tid
+    } break;
+    case ThreadOperation::Yield:
+      //???? lame super slow
+      klee_warning("thread yield");
+      state.threads.push_back(state.threads.front());
+      state.threads.pop_front();
+      break;
+    case ThreadOperation::Alive: {
+      ref<Expr> &v = arguments.front();
+
+      ExecutionState *free = &state;
+      bool hasInvalid = false, first = true;
+
+      /* XXX This is wasteful, no need to do a full evaluate since we
+         have already got a value. But in the end the caches should
+         handle it for us, albeit with some overhead. */
+      do {
+        ref<ConstantExpr> value;
+        bool success = solver->getValue(*free, v, value);
+        assert(success && "FIXME: Unhandled solver failure");
+        (void) success;
+        StatePair res = fork(*free, EqExpr::create(v, value), true);
+        if (res.first) {
+          uint32_t tid = value->getZExtValue();
+
+          if(res.first->tids.count(tid) > 0) {
+            bool alive = false;
+            for(ThreadList::const_iterator i = res.first->threads.begin(); 
+              i != res.first->threads.end(); ++i) 
+            {
+              if(i->tid == tid) {
+                alive = true;
+                break;
+              }
+            }
+            bindLocal(ki, *res.first, res.first->threads.front(), ConstantExpr::create(alive, Expr::Int32));
+          } else {
+            if (!hasInvalid) {
+              klee_warning("invalid tid %d", tid);
+              terminateStateOnExecError(state, "alive called for invalid tid");
+              hasInvalid = true;
+            }            
+          }
+        }
+
+        first = false;
+        free = res.second;
+      } while (free);
+    } break;
+    case ThreadOperation::Detach: {
+      ref<Expr> &v = arguments.front();
+
+      ExecutionState *free = &state;
+      bool hasInvalid = false, first = true;
+
+      /* XXX This is wasteful, no need to do a full evaluate since we
+         have already got a value. But in the end the caches should
+         handle it for us, albeit with some overhead. */
+      do {
+        ref<ConstantExpr> value;
+        bool success = solver->getValue(*free, v, value);
+        assert(success && "FIXME: Unhandled solver failure");
+        (void) success;
+        StatePair res = fork(*free, EqExpr::create(v, value), true);
+        if (res.first) {
+          uint32_t tid = value->getZExtValue();
+
+          if(res.first->tids.count(tid) > 0) {
+            res.first->detachedTids.insert(tid);
+          } else {
+            if (!hasInvalid) {
+              klee_warning("invalid tid %d", tid);
+              terminateStateOnExecError(state, "alive called for invalid tid");
+              hasInvalid = true;
+            }            
+          }
+        }
+
+        first = false;
+        free = res.second;
+      } while (free);
+    } break;
+    case ThreadOperation::Tid:
+      bindLocal(ki, state, state.threads.front(), ConstantExpr::create(state.threads.front().tid, Expr::Int32));
+      break;
+    default:
+      break;
+    }
   } else {
     // FIXME: I'm not really happy about this reliance on prevPC but it is ok, I
     // guess. This just done to avoid having to pass KInstIterator everywhere
     // instead of the actual instruction, since we can't make a KInstIterator
     // from just an instruction (unlike LLVM).
-    KFunction *kf = kmodule->functionMap[f];
-    state.pushFrame(state.prevPC, kf);
-    state.pc = kf->instructions;
-        
-    if (statsTracker)
-      statsTracker->framePushed(state, &state.stack[state.stack.size()-2]);
- 
-     // TODO: support "byval" parameter attribute
-     // TODO: support zeroext, signext, sret attributes
-        
-    unsigned callingArgs = arguments.size();
-    unsigned funcArgs = f->arg_size();
-    if (!f->isVarArg()) {
-      if (callingArgs > funcArgs) {
-        klee_warning_once(f, "calling %s with extra arguments.", 
-                          f->getName().data());
-      } else if (callingArgs < funcArgs) {
-        terminateStateOnError(state, "calling function with too few arguments", 
-                              "user.err");
-        return;
-      }
-    } else {
-      if (callingArgs < funcArgs) {
-        terminateStateOnError(state, "calling function with too few arguments", 
-                              "user.err");
-        return;
-      }
-            
-      StackFrame &sf = state.stack.back();
-      unsigned size = 0;
-      for (unsigned i = funcArgs; i < callingArgs; i++) {
-        // FIXME: This is really specific to the architecture, not the pointer
-        // size. This happens to work fir x86-32 and x86-64, however.
-        Expr::Width WordSize = Context::get().getPointerWidth();
-        if (WordSize == Expr::Int32) {
-          size += Expr::getMinBytesForWidth(arguments[i]->getWidth());
-        } else {
-          size += llvm::RoundUpToAlignment(arguments[i]->getWidth(), 
-                                           WordSize) / 8;
-        }
-      }
-
-      MemoryObject *mo = sf.varargs = memory->allocate(size, true, false, 
-                                                       state.prevPC->inst);
-      if (!mo) {
-        terminateStateOnExecError(state, "out of memory (varargs)");
-        return;
-      }
-      ObjectState *os = bindObjectInState(state, mo, true);
-      unsigned offset = 0;
-      for (unsigned i = funcArgs; i < callingArgs; i++) {
-        // FIXME: This is really specific to the architecture, not the pointer
-        // size. This happens to work fir x86-32 and x86-64, however.
-        Expr::Width WordSize = Context::get().getPointerWidth();
-        if (WordSize == Expr::Int32) {
-          os->write(offset, arguments[i]);
-          offset += Expr::getMinBytesForWidth(arguments[i]->getWidth());
-        } else {
-          assert(WordSize == Expr::Int64 && "Unknown word size!");
-          os->write(offset, arguments[i]);
-          offset += llvm::RoundUpToAlignment(arguments[i]->getWidth(), 
-                                             WordSize) / 8;
-        }
-      }
-    }
-
-    unsigned numFormals = f->arg_size();
-    for (unsigned i=0; i<numFormals; ++i) 
-      bindArgument(kf, i, state, arguments[i]);
+    pushCall(state, state.threads.front(), ki, f, arguments);
   }
 }
 
+void Executor::pushCall(ExecutionState& es,ThreadState &state, 
+                         KInstruction *ki,
+                         Function *f,
+                         std::vector< ref<Expr> > &arguments) {
+  KFunction *kf = kmodule->functionMap[f];
+  state.stack.push_back(StackFrame(state.prevPC, kf));
+  state.pc = kf->instructions;
+      
+  if (statsTracker) {
+    if(state.stack.size() > 1) 
+      statsTracker->framePushed(state, &state.stack[state.stack.size()-2]);
+    else {
+      statsTracker->framePushed(state, 0);
+    }
+  }
+
+   // TODO: support "byval" parameter attribute
+   // TODO: support zeroext, signext, sret attributes
+      
+  unsigned callingArgs = arguments.size();
+  unsigned funcArgs = f->arg_size();
+  if (!f->isVarArg()) {
+    if (callingArgs > funcArgs) {
+      klee_warning_once(f, "calling %s with extra arguments.", 
+                        f->getName().data());
+    } else if (callingArgs < funcArgs) {
+      terminateStateOnError(es, "calling function with too few arguments", 
+                            "user.err");
+      return;
+    }
+  } else {
+    if (callingArgs < funcArgs) {
+      terminateStateOnError(es, "calling function with too few arguments", 
+                            "user.err");
+      return;
+    }
+          
+    StackFrame &sf = state.stack.back();
+    unsigned size = 0;
+    for (unsigned i = funcArgs; i < callingArgs; i++) {
+      // FIXME: This is really specific to the architecture, not the pointer
+      // size. This happens to work fir x86-32 and x86-64, however.
+      Expr::Width WordSize = Context::get().getPointerWidth();
+      if (WordSize == Expr::Int32) {
+        size += Expr::getMinBytesForWidth(arguments[i]->getWidth());
+      } else {
+        size += llvm::RoundUpToAlignment(arguments[i]->getWidth(), 
+                                         WordSize) / 8;
+      }
+    }
+
+    MemoryObject *mo = sf.varargs = memory->allocate(size, true, false, 
+                                                     state.prevPC->inst);
+    if (!mo) {
+      terminateStateOnExecError(es, "out of memory (varargs)");
+      return;
+    }
+    ObjectState *os = bindObjectInState(es, state, mo, true);
+    unsigned offset = 0;
+    for (unsigned i = funcArgs; i < callingArgs; i++) {
+      // FIXME: This is really specific to the architecture, not the pointer
+      // size. This happens to work fir x86-32 and x86-64, however.
+      Expr::Width WordSize = Context::get().getPointerWidth();
+      if (WordSize == Expr::Int32) {
+        os->write(offset, arguments[i]);
+        offset += Expr::getMinBytesForWidth(arguments[i]->getWidth());
+      } else {
+        assert(WordSize == Expr::Int64 && "Unknown word size!");
+        os->write(offset, arguments[i]);
+        offset += llvm::RoundUpToAlignment(arguments[i]->getWidth(), 
+                                           WordSize) / 8;
+      }
+    }
+  }
+
+  unsigned numFormals = f->arg_size();
+  for (unsigned i=0; i<numFormals; ++i) 
+    bindArgument(kf, i, es, state, arguments[i]);
+}
 void Executor::transferToBasicBlock(BasicBlock *dst, BasicBlock *src, 
                                     ExecutionState &state) {
   // Note that in general phi nodes can reuse phi values from the same
@@ -1246,11 +1413,11 @@ void Executor::transferToBasicBlock(BasicBlock *dst, BasicBlock *src,
   // instructions know which argument to eval, set the pc, and continue.
   
   // XXX this lookup has to go ?
-  KFunction *kf = state.stack.back().kf;
+  KFunction *kf = state.threads.front().stack.back().kf;
   unsigned entry = kf->basicBlockEntry[dst];
-  state.pc = &kf->instructions[entry];
-  if (state.pc->inst->getOpcode() == Instruction::PHI) {
-    PHINode *first = static_cast<PHINode*>(state.pc->inst);
+  state.threads.front().pc = &kf->instructions[entry];
+  if (state.threads.front().pc->inst->getOpcode() == Instruction::PHI) {
+    PHINode *first = static_cast<PHINode*>(state.threads.front().pc->inst);
     state.incomingBBIndex = first->getBasicBlockIndex(src);
   }
 }
@@ -1325,7 +1492,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     // Control flow
   case Instruction::Ret: {
     ReturnInst *ri = cast<ReturnInst>(i);
-    KInstIterator kcaller = state.stack.back().caller;
+    KInstIterator kcaller = state.threads.front().stack.back().caller;
     Instruction *caller = kcaller ? kcaller->inst : 0;
     bool isVoidReturn = (ri->getNumOperands() == 0);
     ref<Expr> result = ConstantExpr::alloc(0, Expr::Bool);
@@ -1334,20 +1501,27 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       result = eval(ki, 0, state).value;
     }
     
-    if (state.stack.size() <= 1) {
+    if (state.threads.front().stack.size() <= 1 && state.threads.size() == 1) {
+      // klee_warning("final thread tear down");
       assert(!caller && "caller set on initial stack frame");
       terminateStateOnExit(state);
+    } else if (state.threads.front().stack.size() <= 1) {
+      // klee_warning("a thread tear down");
+      assert(!caller && "caller set on initial stack frame");
+      if(state.detachedTids.count(state.threads.front().tid))
+        state.tids.erase(state.threads.front().tid);
+      state.threads.pop_front();
     } else {
       state.popFrame();
 
       if (statsTracker)
-        statsTracker->framePopped(state);
+        statsTracker->framePopped(state.threads.front());
 
       if (InvokeInst *ii = dyn_cast<InvokeInst>(caller)) {
         transferToBasicBlock(ii->getNormalDest(), caller->getParent(), state);
       } else {
-        state.pc = kcaller;
-        ++state.pc;
+        state.threads.front().pc = kcaller;
+        ++state.threads.front().pc;
       }
 
       if (!isVoidReturn) {
@@ -1369,7 +1543,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
             }
           }
 
-          bindLocal(kcaller, state, result);
+          bindLocal(kcaller, state, state.threads.front(), result);
         }
       } else {
         // We check that the return value has no users instead of
@@ -1384,13 +1558,13 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   }
   case Instruction::Unwind: {
     for (;;) {
-      KInstruction *kcaller = state.stack.back().caller;
+      KInstruction *kcaller = state.threads.front().stack.back().caller;
       state.popFrame();
 
       if (statsTracker)
-        statsTracker->framePopped(state);
+        statsTracker->framePopped(state.threads.front());
 
-      if (state.stack.empty()) {
+      if (state.threads.front().stack.empty()) {
         terminateStateOnExecError(state, "unwind from initial stack frame");
         break;
       } else {
@@ -1418,7 +1592,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       // requires that we still be in the context of the branch
       // instruction (it reuses its statistic id). Should be cleaned
       // up with convenient instruction specific data.
-      if (statsTracker && state.stack.back().kf->trackCoverage)
+      if (statsTracker && state.threads.front().stack.back().kf->trackCoverage)
         statsTracker->markBranchVisited(branches.first, branches.second);
 
       if (branches.first)
@@ -1604,7 +1778,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   }
   case Instruction::PHI: {
     ref<Expr> result = eval(ki, state.incomingBBIndex * 2, state).value;
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1617,7 +1791,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> tExpr = eval(ki, 1, state).value;
     ref<Expr> fExpr = eval(ki, 2, state).value;
     ref<Expr> result = SelectExpr::create(cond, tExpr, fExpr);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1630,21 +1804,21 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   case Instruction::Add: {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
-    bindLocal(ki, state, AddExpr::create(left, right));
+    bindLocal(ki, state, state.threads.front(), AddExpr::create(left, right));
     break;
   }
 
   case Instruction::Sub: {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
-    bindLocal(ki, state, SubExpr::create(left, right));
+    bindLocal(ki, state, state.threads.front(), SubExpr::create(left, right));
     break;
   }
  
   case Instruction::Mul: {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
-    bindLocal(ki, state, MulExpr::create(left, right));
+    bindLocal(ki, state, state.threads.front(), MulExpr::create(left, right));
     break;
   }
 
@@ -1652,7 +1826,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = UDivExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1660,7 +1834,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = SDivExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1668,7 +1842,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = URemExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
  
@@ -1676,7 +1850,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = SRemExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1684,7 +1858,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = AndExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1692,7 +1866,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = OrExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1700,7 +1874,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = XorExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1708,7 +1882,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = ShlExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1716,7 +1890,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = LShrExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1724,7 +1898,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> left = eval(ki, 0, state).value;
     ref<Expr> right = eval(ki, 1, state).value;
     ref<Expr> result = AShrExpr::create(left, right);
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1739,7 +1913,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = EqExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1747,7 +1921,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = NeExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1755,7 +1929,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = UgtExpr::create(left, right);
-      bindLocal(ki, state,result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1763,7 +1937,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = UgeExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1771,7 +1945,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = UltExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1779,7 +1953,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = UleExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1787,7 +1961,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = SgtExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1795,7 +1969,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = SgeExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1803,7 +1977,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = SltExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1811,7 +1985,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> left = eval(ki, 0, state).value;
       ref<Expr> right = eval(ki, 1, state).value;
       ref<Expr> result = SleExpr::create(left, right);
-      bindLocal(ki, state, result);
+      bindLocal(ki, state, state.threads.front(), result);
       break;
     }
 
@@ -1877,7 +2051,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     if (kgepi->offset)
       base = AddExpr::create(base,
                              Expr::createPointer(kgepi->offset));
-    bindLocal(ki, state, base);
+    bindLocal(ki, state, state.threads.front(), base);
     break;
   }
 
@@ -1887,21 +2061,21 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> result = ExtractExpr::create(eval(ki, 0, state).value,
                                            0,
                                            getWidthForLLVMType(ci->getType()));
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
   case Instruction::ZExt: {
     CastInst *ci = cast<CastInst>(i);
     ref<Expr> result = ZExtExpr::create(eval(ki, 0, state).value,
                                         getWidthForLLVMType(ci->getType()));
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
   case Instruction::SExt: {
     CastInst *ci = cast<CastInst>(i);
     ref<Expr> result = SExtExpr::create(eval(ki, 0, state).value,
                                         getWidthForLLVMType(ci->getType()));
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1909,20 +2083,20 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     CastInst *ci = cast<CastInst>(i);
     Expr::Width pType = getWidthForLLVMType(ci->getType());
     ref<Expr> arg = eval(ki, 0, state).value;
-    bindLocal(ki, state, ZExtExpr::create(arg, pType));
+    bindLocal(ki, state, state.threads.front(), ZExtExpr::create(arg, pType));
     break;
   } 
   case Instruction::PtrToInt: {
     CastInst *ci = cast<CastInst>(i);
     Expr::Width iType = getWidthForLLVMType(ci->getType());
     ref<Expr> arg = eval(ki, 0, state).value;
-    bindLocal(ki, state, ZExtExpr::create(arg, iType));
+    bindLocal(ki, state, state.threads.front(), ZExtExpr::create(arg, iType));
     break;
   }
 
   case Instruction::BitCast: {
     ref<Expr> result = eval(ki, 0, state).value;
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
 
@@ -1939,7 +2113,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     llvm::APFloat Res(left->getAPValue());
     Res.add(APFloat(right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(Res.bitcastToAPInt()));
     break;
   }
 
@@ -1954,7 +2128,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     llvm::APFloat Res(left->getAPValue());
     Res.subtract(APFloat(right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(Res.bitcastToAPInt()));
     break;
   }
  
@@ -1969,7 +2143,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     llvm::APFloat Res(left->getAPValue());
     Res.multiply(APFloat(right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(Res.bitcastToAPInt()));
     break;
   }
 
@@ -1984,7 +2158,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     llvm::APFloat Res(left->getAPValue());
     Res.divide(APFloat(right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(Res.bitcastToAPInt()));
     break;
   }
 
@@ -1999,7 +2173,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     llvm::APFloat Res(left->getAPValue());
     Res.mod(APFloat(right->getAPValue()), APFloat::rmNearestTiesToEven);
-    bindLocal(ki, state, ConstantExpr::alloc(Res.bitcastToAPInt()));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(Res.bitcastToAPInt()));
     break;
   }
 
@@ -2016,7 +2190,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     Res.convert(*fpWidthToSemantics(resultType),
                 llvm::APFloat::rmNearestTiesToEven,
                 &losesInfo);
-    bindLocal(ki, state, ConstantExpr::alloc(Res));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(Res));
     break;
   }
 
@@ -2033,7 +2207,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     Res.convert(*fpWidthToSemantics(resultType),
                 llvm::APFloat::rmNearestTiesToEven,
                 &losesInfo);
-    bindLocal(ki, state, ConstantExpr::alloc(Res));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(Res));
     break;
   }
 
@@ -2050,7 +2224,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     bool isExact = true;
     Arg.convertToInteger(&value, resultType, false,
                          llvm::APFloat::rmTowardZero, &isExact);
-    bindLocal(ki, state, ConstantExpr::alloc(value, resultType));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(value, resultType));
     break;
   }
 
@@ -2067,7 +2241,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     bool isExact = true;
     Arg.convertToInteger(&value, resultType, false,
                          llvm::APFloat::rmTowardZero, &isExact);
-    bindLocal(ki, state, ConstantExpr::alloc(value, resultType));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(value, resultType));
     break;
   }
 
@@ -2083,7 +2257,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     f.convertFromAPInt(arg->getAPValue(), false,
                        llvm::APFloat::rmNearestTiesToEven);
 
-    bindLocal(ki, state, ConstantExpr::alloc(f));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(f));
     break;
   }
 
@@ -2099,7 +2273,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     f.convertFromAPInt(arg->getAPValue(), true,
                        llvm::APFloat::rmNearestTiesToEven);
 
-    bindLocal(ki, state, ConstantExpr::alloc(f));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(f));
     break;
   }
 
@@ -2192,7 +2366,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       break;
     }
 
-    bindLocal(ki, state, ConstantExpr::alloc(Result, Expr::Bool));
+    bindLocal(ki, state, state.threads.front(), ConstantExpr::alloc(Result, Expr::Bool));
     break;
   }
   case Instruction::InsertValue: {
@@ -2219,7 +2393,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     else
       result = val;
 
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
   case Instruction::ExtractValue: {
@@ -2229,7 +2403,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     ref<Expr> result = ExtractExpr::create(agg, kgepi->offset*8, getWidthForLLVMType(i->getType()));
 
-    bindLocal(ki, state, result);
+    bindLocal(ki, state, state.threads.front(), result);
     break;
   }
  
@@ -2364,7 +2538,7 @@ void Executor::run(ExecutionState &initialState) {
       lastState = it->first;
       unsigned numSeeds = it->second.size();
       ExecutionState &state = *lastState;
-      KInstruction *ki = state.pc;
+      KInstruction *ki = state.threads.front().pc;
       stepInstruction(state);
 
       executeInstruction(state, ki);
@@ -2414,7 +2588,7 @@ void Executor::run(ExecutionState &initialState) {
 
   while (!states.empty() && !haltExecution) {
     ExecutionState &state = searcher->selectState();
-    KInstruction *ki = state.pc;
+    KInstruction *ki = state.threads.front().pc;
     stepInstruction(state);
 
     executeInstruction(state, ki);
@@ -2536,7 +2710,7 @@ void Executor::terminateState(ExecutionState &state) {
 
   std::set<ExecutionState*>::iterator it = addedStates.find(&state);
   if (it==addedStates.end()) {
-    state.pc = state.prevPC;
+    state.threads.front().pc = state.threads.front().prevPC;
 
     removedStates.insert(&state);
   } else {
@@ -2573,10 +2747,10 @@ void Executor::terminateStateOnError(ExecutionState &state,
                                      const llvm::Twine &info) {
   std::string message = messaget.str();
   static std::set< std::pair<Instruction*, std::string> > emittedErrors;
-  const InstructionInfo &ii = *state.prevPC->info;
+  const InstructionInfo &ii = *state.threads.front().prevPC->info;
   
   if (EmitAllErrors ||
-      emittedErrors.insert(std::make_pair(state.prevPC->inst, message)).second) {
+      emittedErrors.insert(std::make_pair(state.threads.front().prevPC->inst, message)).second) {
     if (ii.file != "") {
       klee_message("ERROR: %s:%d: %s", ii.file.c_str(), ii.line, message.c_str());
     } else {
@@ -2619,7 +2793,7 @@ void Executor::callExternalFunction(ExecutionState &state,
   // check if specialFunctionHandler wants it
   if (specialFunctionHandler->handle(state, function, target, arguments))
     return;
-  
+      
   if (NoExternals && !okExternals.count(function->getName())) {
     std::cerr << "KLEE:ERROR: Calling not-OK external function : " 
                << function->getNameStr() << "\n";
@@ -2693,7 +2867,7 @@ void Executor::callExternalFunction(ExecutionState &state,
   if (resultType != Type::getVoidTy(getGlobalContext())) {
     ref<Expr> e = ConstantExpr::fromMemory((void*) args, 
                                            getWidthForLLVMType(resultType));
-    bindLocal(target, state, e);
+    bindLocal(target, state, state.threads.front(), e);
   }
 }
 
@@ -2724,8 +2898,15 @@ ref<Expr> Executor::replaceReadWithSymbolic(ExecutionState &state,
   state.addConstraint(eq);
   return res;
 }
-
-ObjectState *Executor::bindObjectInState(ExecutionState &state, 
+ObjectState *Executor::bindObjectInState(ExecutionState &state,
+                                         const MemoryObject *mo,
+                                         const Array *array) {
+  ObjectState *os = array ? new ObjectState(mo, array) : new ObjectState(mo);
+  state.addressSpace.bindObject(mo, os);
+  return os;
+}
+ObjectState *Executor::bindObjectInState(ExecutionState &state,
+                                        ThreadState& ts,
                                          const MemoryObject *mo,
                                          bool isLocal,
                                          const Array *array) {
@@ -2737,7 +2918,7 @@ ObjectState *Executor::bindObjectInState(ExecutionState &state,
   // matter because all we use this list for is to unbind the object
   // on function return.
   if (isLocal)
-    state.stack.back().allocas.push_back(mo);
+    state.threads.front().stack.back().allocas.push_back(mo);
 
   return os;
 }
@@ -2751,18 +2932,18 @@ void Executor::executeAlloc(ExecutionState &state,
   size = toUnique(state, size);
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(size)) {
     MemoryObject *mo = memory->allocate(CE->getZExtValue(), isLocal, false, 
-                                        state.prevPC->inst);
+                                        state.threads.front().prevPC->inst);
     if (!mo) {
-      bindLocal(target, state, 
+      bindLocal(target, state, state.threads.front(), 
                 ConstantExpr::alloc(0, Context::get().getPointerWidth()));
     } else {
-      ObjectState *os = bindObjectInState(state, mo, isLocal);
+      ObjectState *os = bindObjectInState(state, state.threads.front(), mo, isLocal);
       if (zeroMemory) {
         os->initializeToZero();
       } else {
         os->initializeToRandom();
       }
-      bindLocal(target, state, mo->getBaseExpr());
+      bindLocal(target, state, state.threads.front(), mo->getBaseExpr());
       
       if (reallocFrom) {
         unsigned count = std::min(reallocFrom->size, os->size);
@@ -2827,7 +3008,7 @@ void Executor::executeAlloc(ExecutionState &state,
                true);
         if (hugeSize.first) {
           klee_message("NOTE: found huge malloc, returning 0");
-          bindLocal(target, *hugeSize.first, 
+          bindLocal(target, *hugeSize.first, state.threads.front(),
                     ConstantExpr::alloc(0, Context::get().getPointerWidth()));
         }
         
@@ -2856,7 +3037,7 @@ void Executor::executeFree(ExecutionState &state,
   StatePair zeroPointer = fork(state, Expr::createIsZero(address), true);
   if (zeroPointer.first) {
     if (target)
-      bindLocal(target, *zeroPointer.first, Expr::createPointer(0));
+      bindLocal(target, *zeroPointer.first, state.threads.front(), Expr::createPointer(0));
   }
   if (zeroPointer.second) { // address != 0
     ExactResolutionList rl;
@@ -2878,7 +3059,7 @@ void Executor::executeFree(ExecutionState &state,
       } else {
         it->second->addressSpace.unbindObject(mo);
         if (target)
-          bindLocal(target, *it->second, Expr::createPointer(0));
+          bindLocal(target, *it->second, state.threads.front(), Expr::createPointer(0));
       }
     }
   }
@@ -2957,7 +3138,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
                                       inBounds);
     solver->setTimeout(0);
     if (!success) {
-      state.pc = state.prevPC;
+      state.threads.front().pc = state.threads.front().prevPC;
       terminateStateEarly(state, "query timed out");
       return;
     }
@@ -2979,7 +3160,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
         if (interpreterOpts.MakeConcreteSymbolic)
           result = replaceReadWithSymbolic(state, result);
         
-        bindLocal(target, state, result);
+        bindLocal(target, state, state.threads.front(), result);
       }
 
       return;
@@ -3019,7 +3200,7 @@ void Executor::executeMemoryOperation(ExecutionState &state,
         }
       } else {
         ref<Expr> result = os->read(mo->getOffsetExpr(address), type);
-        bindLocal(target, *bound, result);
+        bindLocal(target, *bound, state.threads.front(), result);
       }
     }
 
@@ -3048,7 +3229,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     static unsigned id = 0;
     const Array *array = new Array("arr" + llvm::utostr(++id),
                                    mo->size);
-    bindObjectInState(state, mo, false, array);
+    bindObjectInState(state, mo, array);
     state.addSymbolic(mo, array);
     
     std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
@@ -3098,7 +3279,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       }
     }
   } else {
-    ObjectState *os = bindObjectInState(state, mo, false);
+    ObjectState *os = bindObjectInState(state, mo);
     if (replayPosition >= replayOut->numObjects) {
       terminateStateOnError(state, "replay count mismatch", "user.err");
     } else {
@@ -3167,14 +3348,14 @@ void Executor::runFunctionAsMain(Function *f,
 
 
   if (statsTracker)
-    statsTracker->framePushed(*state, 0);
+    statsTracker->framePushed(state->threads.front(), 0);
 
   assert(arguments.size() == f->arg_size() && "wrong number of arguments");
   for (unsigned i = 0, e = f->arg_size(); i != e; ++i)
-    bindArgument(kf, i, *state, arguments[i]);
+    bindArgument(kf, i, *state, state->threads.front(), arguments[i]);
 
   if (argvMO) {
-    ObjectState *argvOS = bindObjectInState(*state, argvMO, false);
+    ObjectState *argvOS = bindObjectInState(*state, argvMO);
 
     for (int i=0; i<argc+1+envc+1+1; i++) {
       MemoryObject *arg;
@@ -3185,8 +3366,8 @@ void Executor::runFunctionAsMain(Function *f,
         char *s = i<argc ? argv[i] : envp[i-(argc+1)];
         int j, len = strlen(s);
         
-        arg = memory->allocate(len+1, false, true, state->pc->inst);
-        ObjectState *os = bindObjectInState(*state, arg, false);
+        arg = memory->allocate(len+1, false, true, state->threads.front().pc->inst);
+        ObjectState *os = bindObjectInState(*state, arg);
         for (j=0; j<len+1; j++)
           os->write8(j, s[j]);
       }
